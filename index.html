@@ -3482,6 +3482,10 @@ function Game(cfg) {
   if (col === 'r') col = Math.random() < 0.5 ? 'w' : 'b';
   this.userColor = col || 'w';
   this.names = R ? R.names : cfg.names;
+  // reprise d'une partie : l'entraîneur rejoue les coups réels tant que le joueur les suit
+  this.script = R ? (R.script || null) : (cfg.script || null);
+  this.scriptFrom = R ? (R.scriptFrom || 0) : (cfg.moves || []).length;
+  this.scriptDone = false;
   this.startFen = R ? R.startFen : (cfg.fen || Engine.START);
   this.pos = new Engine.Pos().load(this.startFen);
   this.startCounts = this.pos.material().counts;
@@ -3498,7 +3502,7 @@ function Game(cfg) {
   pre.forEach(function (u) { self.play(u, { silent: true }); });
   this.render(false);
   if (!R && this.bot && this.mode !== 'practice' && App.settings.comments) {
-    this.say({ who: 'bot', text: this.mode === 'coach' ? TEACHER.hi[0] : this.bot.hi[0] });
+    this.say({ who: 'bot', text: this.script ? 'Je rejoue les coups de ton adversaire : à toi de retrouver les tiens, ou d\'en essayer de meilleurs. Si tu t\'écartes de la partie, je continue librement.' : this.mode === 'coach' ? TEACHER.hi[0] : this.bot.hi[0] });
   }
   if (this.mode === 'practice') this.say({ who: 'bot', text: this.practice.title + ' — objectif : ' + (this.practice.goal === 'mate' ? 'mater' : 'promouvoir un pion') + (this.practice.limit ? ' en ' + this.practice.limit + ' coups maximum.' : '.') });
   this.tick = setInterval(function () { self.clockTick(); }, 100);
@@ -3520,7 +3524,7 @@ Game.prototype.uciList = function (n) { return this.hist.slice(0, n == null ? th
 /* ---------- construction DOM ---------- */
 Game.prototype.build = function () {
   var self = this;
-  var title = this.mode === 'local' ? 'Deux joueurs' : this.mode === 'coach' ? 'Leçon-partie' : this.mode === 'practice' ? 'Entraînement' : 'Contre ' + this.bot.name;
+  var title = this.mode === 'local' ? 'Deux joueurs' : this.script ? 'Reprise de la partie' : this.mode === 'coach' ? 'Leçon-partie' : this.mode === 'practice' ? 'Entraînement' : 'Contre ' + this.bot.name;
   this.btnCom = h('button', { class: 'iconbtn', 'aria-label': 'Commentaires', onclick: function () { self.toggleComments(); } });
   var right = h('div', { style: { display: 'flex' } }, this.mode !== 'local' ? this.btnCom : null,
     h('button', { class: 'iconbtn', 'aria-label': 'Réglages', html: icon('gear'), onclick: function () { self.openSettings(); } }));
@@ -3609,13 +3613,28 @@ Game.prototype.play = function (uci, o) {
   } else this.maybeBot();
   return true;
 };
+/* coup réel de la partie reprise, tant que l'échiquier suit cette partie */
+Game.prototype.scriptOn = function () {
+  var S = this.script, n = this.hist.length; if (!S) return false;
+  for (var i = 0; i < n && i < S.length; i++) if (this.hist[i].uci !== S[i]) return false;
+  return true;
+};
+Game.prototype.scriptMove = function () {
+  return this.scriptOn() && this.hist.length < this.script.length ? this.script[this.hist.length] : null;
+};
+Game.prototype.noteScriptExit = function () {
+  if (!this.script || this.scriptDone || this.scriptMove()) return;
+  this.scriptDone = true;
+  toast(this.scriptOn() ? 'Fin de la partie jouée : on continue librement.' : 'Tu as quitté la partie jouée : je réponds librement.', 2800);
+};
 Game.prototype.maybeBot = function () {
   if (this.result || this.mode === 'local' || this.isUserTurn() || this.thinkingTok) return;
-  var self = this, tok = ++this.token, t0 = performance.now();
+  this.noteScriptExit();
+  var self = this, tok = ++this.token, t0 = performance.now(), scripted = this.scriptMove();
   this.thinking = true; this.thinkingTok = tok; this.renderBars();
   var elo = this.mode === 'coach' ? this.coachElo() : this.bot.elo;
   var std = this.startFen === Engine.START;
-  botChoose(elo, this.startFen, this.uciList(), this.pos.fen(), std).then(function (u) {
+  (scripted ? Promise.resolve(scripted) : botChoose(elo, this.startFen, this.uciList(), this.pos.fen(), std)).then(function (u) {
     if (tok !== self.token) return;
     var minDelay = self.mode === 'practice' ? 250 : elo < 1200 ? 500 + Math.random() * 700 : 300 + Math.random() * 400;
     var wait = Math.max(0, minDelay - (performance.now() - t0));
@@ -3624,6 +3643,7 @@ Game.prototype.maybeBot = function () {
       self.thinking = false; self.thinkingTok = 0;
       var fenB = self.pos.fen();
       if (!u || !self.play(u, { bot: true })) { self.renderBars(); return; }
+      if (scripted) self.hist[self.hist.length - 1].scripted = true;
       if (self.mode === 'coach' && App.settings.comments && !self.result) self.botSelfComment(fenB);
       self.prefetch();
       self.tryPremove();
@@ -3676,6 +3696,7 @@ Game.prototype.botSelfComment = function (fenB) {
   var name = Book.nameOf([rec.fenAfter]);
   var sc = Coach.selfComment(fenB, rec.uci, rec.fenAfter, 0, rec.book, name);
   if (!sc || !sc.text) return;
+  if (rec.scripted) sc.text = sc.text.replace(/^Je joue /, 'Comme dans la partie, je joue ');
   if (this.comment && this.comment.who === 'coach' && this.comment.idx === this.hist.length - 2) {
     this.comment.reply = sc.text;
     if (sc.threat && App.settings.coachArrows) { this.comment.arrows = (this.comment.arrows || []).filter(function (a) { return a[2] !== 'r'; }); this.comment.arrows.push([sc.threat.uci.slice(0, 2), sc.threat.uci.slice(2, 4), 'r']); }
@@ -3759,16 +3780,17 @@ Game.prototype.end = function (res, reason) {
   Sound.play('end'); buzz(40);
   var uc = this.userColor, userScore = res === '1/2-1/2' ? 0.5 : ((res === '1-0') === (uc === 'w') ? 1 : 0);
   var delta = null, P = App.profile;
-  if (this.mode === 'bot' || this.mode === 'coach') {
+  var rated = (this.mode === 'bot' || this.mode === 'coach') && !this.script; // une reprise n'est pas une vraie partie
+  if (rated) {
     var oppElo = this.mode === 'coach' ? this.coachElo() : this.bot.elo;
     delta = App.updateRating(oppElo, userScore);
     P.games++; if (userScore === 1) P.w++; else if (userScore === 0) P.l++; else P.d++; App.save();
   }
   var wName = this.playerName('w'), bName = this.playerName('b');
-  var g = { id: this.id, date: Date.now(), mode: this.mode, botId: this.botId, userColor: uc, white: wName, black: bName, result: res, reason: reason, startFen: this.startFen, moves: this.uciList(), delta: delta };
+  var g = { id: this.id, date: Date.now(), mode: this.mode, botId: this.botId, userColor: uc, white: wName, black: bName, result: res, reason: reason, startFen: this.startFen, moves: this.uciList(), delta: delta, replay: this.script ? true : undefined };
   App.history.push(g); App.saveHistory();
   this.saved = g;
-  if (this.mode === 'bot' || this.mode === 'coach') autoReview(g);
+  if (rated) autoReview(g);
   this.render(false);
   if (this.bot && App.settings.comments) {
     var who = this.mode === 'coach' ? TEACHER : this.bot;
@@ -3790,7 +3812,7 @@ Game.prototype.showEnd = function (userScore, delta) {
     h('div', { class: 'btns' },
       h('button', { class: 'btn primary', html: icon('chart') + 'Bilan de la partie', onclick: function () { md.close(); App.go('review', { game: self.saved }, { replace: true }); } }),
       h('div', { class: 'row' },
-        h('button', { class: 'btn', text: 'Revanche', onclick: function () { md.close(); App.go('game', { mode: self.mode, botId: self.botId, color: local ? 'w' : (self.userColor === 'w' ? 'b' : 'w'), tc: self.tc.id, names: self.names }, { replace: true }); } }),
+        h('button', { class: 'btn', text: self.script ? 'Recommencer' : 'Revanche', onclick: function () { md.close(); if (self.script) { App.go('game', { mode: self.mode, botId: self.botId, color: self.userColor, tc: self.tc.id, fen: self.startFen, moves: self.script.slice(0, self.scriptFrom), script: self.script }, { replace: true }); return; } App.go('game', { mode: self.mode, botId: self.botId, color: local ? 'w' : (self.userColor === 'w' ? 'b' : 'w'), tc: self.tc.id, names: self.names }, { replace: true }); } }),
         h('button', { class: 'btn', text: local ? 'Menu' : 'Autre bot', onclick: function () { md.close(); App.go(local ? 'home' : 'setupBot', {}, { root: local }); } })))
   ]);
   md.el.style.position = 'relative';
@@ -3818,7 +3840,7 @@ Game.prototype.takeback = function (fromCoach) {
   if (!App.settings.takebacks && !fromCoach) { toast('Reprises désactivées dans les réglages'); return; }
   if (this.result && this.mode !== 'practice') { toast('La partie est terminée'); return; }
   if (!this.hist.length) return;
-  this.token++; this.thinking = false; this.thinkingTok = 0; this.thinkingCoach = false;
+  this.token++; this.thinking = false; this.thinkingTok = 0; this.thinkingCoach = false; this.scriptDone = false;
   if (EngineClient.busy()) EngineClient.reset();
   var n = 1;
   if (this.mode !== 'local') { n = this.isUserTurn() ? 2 : 1; if (n === 2 && this.hist.length < 2) n = this.hist.length === 1 && this.hist[0].color === this.userColor ? 1 : 0; }
@@ -4004,7 +4026,7 @@ Game.prototype.renderStrip = function () {
 };
 Game.prototype.saveCurrent = function () {
   if (this.mode === 'practice' || this.result) return;
-  Store.set('current', { mode: this.mode, botId: this.botId, userColor: this.userColor, startFen: this.startFen, moves: this.uciList(), tc: this.tc.id, clock: this.clock, names: this.names, adapt: this.adapt, coachBase: this.coachBase, id: this.id });
+  Store.set('current', { mode: this.mode, botId: this.botId, userColor: this.userColor, startFen: this.startFen, moves: this.uciList(), tc: this.tc.id, clock: this.clock, names: this.names, adapt: this.adapt, coachBase: this.coachBase, id: this.id, script: this.script, scriptFrom: this.scriptFrom });
 };
 
 /* ===== Bilan de partie ===== */
@@ -4131,6 +4153,10 @@ function renderReview(sc, g, R, params) {
   var avB = local ? { style: 'long', skin: '#c68a62', hair: '#1f1512', bg: '#3c3a37' } : g.userColor === 'b' ? userAvatar() : g.mode === 'import' ? genericAv : botById(g.botId || 'pixel').av;
   var you = g.userColor || 'w', yAcc = you === 'w' ? R.acc.w : R.acc.b;
   var mine = function (m) { return local || m.color === you; };
+  // reprend la position après n demi-coups : tu gardes ta couleur, l'entraîneur rejoue les coups de l'adversaire
+  function replayAt(n) {
+    App.go('game', { mode: local ? 'local' : 'coach', botId: 'coach', color: local ? 'w' : you, tc: 'none', fen: g.startFen, moves: g.moves.slice(0, n), script: local ? null : g.moves, names: local ? { w: g.white, b: g.black } : null });
+  }
   var cnt = R.counts[you] || {}, bl = (cnt.blunder || 0), mi = (cnt.mistake || 0) + (cnt.miss || 0);
   var intro = local ? 'Voici le bilan de votre partie. Parcourez les coups : je commente chacun et je vous montre le meilleur coup quand il y avait mieux.' :
     yAcc >= 85 ? 'Superbe partie ! Ta précision est de ' + yAcc + ' %. Parcourons tes coups ensemble.' : yAcc >= 70 ? 'Bonne partie (' + yAcc + ' %). ' + (bl ? bl + ' gaffe' + (bl > 1 ? 's' : '') + ' à corriger : utilise ⚡ pour y aller directement.' : 'Quelques imprécisions à revoir.') : 'Partie difficile. Concentrons-nous sur les ' + (bl + mi) + ' moments clés (bouton ⚡).';
@@ -4178,7 +4204,8 @@ function renderReview(sc, g, R, params) {
     paneSum.appendChild(h('div', { class: 'bubble-row', style: { padding: '12px 0 4px' } }, h('div', { class: 'av', html: avatarSVG(TEACHER.av) }), h('div', { class: 'bubble', text: intro.replace(' (bouton ⚡)', '').replace(' : utilise ⚡ pour y aller directement', '') })));
     paneSum.appendChild(G);
     paneSum.appendChild(h('p', { class: 'small muted', style: { lineHeight: 1.5, margin: '10px 2px' }, text: 'Tactique : coups où une combinaison ou un gain matériel était en jeu. Stratégie : coups calmes. Le classement de la partie est une estimation tirée de la précision.' }));
-    paneSum.appendChild(h('div', { class: 'row', style: { marginTop: '6px' } },
+    paneSum.appendChild(h('div', { class: 'row', style: { marginTop: '6px', flexWrap: 'wrap' } },
+      h('button', { class: 'btn small', html: icon('play') + 'Rejouer la partie', onclick: function () { replayAt(0); } }),
       h('button', { class: 'btn small', html: icon('copy') + 'PGN', onclick: function () { copyText(pgnMoves(R.startFen, R.moves.map(function (m) { return m.san; })) + ' ' + g.result); } }),
       h('button', { class: 'btn small', text: 'Nouvelle partie', onclick: function () { App.go(local ? 'setupLocal' : g.mode === 'coach' ? 'setupCoach' : g.mode === 'import' ? 'import' : 'setupBot', {}, { replace: true }); } })));
     paneSum.appendChild(h('div', { class: 'sum-cta' }, h('button', { class: 'btn primary', text: 'Démarrer le bilan', onclick: function () { goTab('replay'); show(0); sc.scrollTo({ top: tabs.offsetTop - 8, behavior: 'smooth' }); } })));
@@ -4243,7 +4270,10 @@ function renderReview(sc, g, R, params) {
   }
   function drawCmp(mv) {
     cmp.innerHTML = '';
-    if (!mv) return;
+    if (!mv) {
+      cmp.appendChild(h('div', { class: 'row', style: { gridColumn: '1 / -1' } }, h('button', { class: 'btn small', html: icon('play') + 'Rejouer depuis le début', onclick: function () { replayAt(0); } })));
+      return;
+    }
     var sameBest = !mv.best || mv.best === mv.uci;
     var C = CLASSES[mv.cls];
     var played = h('button', { class: 'cmp-card', onclick: function () { playLine('played', mv); } },
@@ -4261,9 +4291,7 @@ function renderReview(sc, g, R, params) {
     } else cmp.appendChild(h('div', { class: 'cmp-card ok' }, h('small', { text: 'Meilleur coup' }), h('div', { class: 'cmp-m', html: '<i style="background:' + CLASSES.best.color + '">★</i>C\'est celui-ci' }), h('span', { class: 'cmp-e', text: evalFor(mv.bestScore) })));
     var acts = h('div', { class: 'row', style: { gridColumn: '1 / -1' } });
     if (!sameBest && BAD_CLS.indexOf(mv.cls) >= 0 && mine(mv)) acts.appendChild(h('button', { class: 'btn small primary', html: icon('retry') + 'Réessayer', onclick: function () { startRetry(mv); } }));
-    acts.appendChild(h('button', { class: 'btn small', html: icon('play') + 'Rejouer d\'ici', onclick: function () {
-      App.go('game', { mode: local ? 'local' : 'coach', botId: 'coach', color: local ? 'w' : (mv.color === 'w' ? 'b' : 'w'), tc: 'none', fen: g.startFen, moves: g.moves.slice(0, idx), names: local ? { w: g.white, b: g.black } : null });
-    } }));
+    acts.appendChild(h('button', { class: 'btn small', html: icon('play') + 'Rejouer d\'ici', onclick: function () { replayAt(idx); } }));
     cmp.appendChild(acts);
   }
   // --- variantes (meilleur coup / suite du coup joué) ---
