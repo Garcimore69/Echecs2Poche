@@ -358,7 +358,7 @@ input, select { font: inherit; }
 </head>
 <body>
 <div id="app"></div>
-<script type="text/plain" id="engine-src">/* ===== Moteur d'échecs : règles + recherche (0x88) ===== */
+<script id="engine-src">/* ===== Moteur d'échecs : règles + recherche (0x88) ===== */
 var Engine = (function () {
   'use strict';
   var PAWN = 1, KNIGHT = 2, BISHOP = 3, ROOK = 4, QUEEN = 5, KING = 6;
@@ -397,17 +397,24 @@ var Engine = (function () {
   function sqParse(n) { return (n.charCodeAt(1) - 49) * 16 + (n.charCodeAt(0) - 97); }
   var PCH = ' pnbrqk';
 
-  var STACK = 2048;
+  // pile d'annulation : petite au départ (les positions jetables sont très nombreuses), agrandie à la demande
+  var STACK = 64;
   function Pos() {
     this.b = new Int8Array(128);
     this.turn = 0; this.castle = 0; this.ep = -1; this.half = 0; this.full = 1;
     this.kings = [4, 116]; this.hlo = 0; this.hhi = 0;
-    this.sp = 0;
+    this.sp = 0; this.cap = STACK;
     this.stM = new Int32Array(STACK); this.stCap = new Int8Array(STACK);
     this.stCastle = new Int8Array(STACK); this.stEp = new Int16Array(STACK);
     this.stHalf = new Int16Array(STACK); this.stLo = new Int32Array(STACK); this.stHi = new Int32Array(STACK);
   }
   var P = Pos.prototype;
+  P.grow = function () {
+    var n = this.cap * 4;
+    function g(a) { var x = new a.constructor(n); x.set(a); return x; }
+    this.stM = g(this.stM); this.stCap = g(this.stCap); this.stCastle = g(this.stCastle); this.stEp = g(this.stEp);
+    this.stHalf = g(this.stHalf); this.stLo = g(this.stLo); this.stHi = g(this.stHi); this.cap = n;
+  };
 
   P.epHashable = function () {
     // la case e.p. n'est hachée que si une prise e.p. est géométriquement possible
@@ -575,6 +582,7 @@ var Engine = (function () {
   P.make = function (m) {
     var b = this.b, from = m & 127, to = (m >> 7) & 127, promo = (m >> 14) & 7, fl = m >>> 17;
     var p = b[from], cap = b[to], us = this.turn, i = this.sp++;
+    if (i >= this.cap) this.grow();
     this.stM[i] = m; this.stCastle[i] = this.castle; this.stEp[i] = this.ep; this.stHalf[i] = this.half;
     this.stLo[i] = this.hlo; this.stHi[i] = this.hhi;
     var lo = this.hlo, hi = this.hhi;
@@ -627,6 +635,7 @@ var Engine = (function () {
 
   P.makeNull = function () {
     var i = this.sp++;
+    if (i >= this.cap) this.grow();
     this.stM[i] = 0; this.stCastle[i] = this.castle; this.stEp[i] = this.ep; this.stHalf[i] = this.half;
     this.stLo[i] = this.hlo; this.stHi[i] = this.hhi; this.stCap[i] = 0;
     var lo = this.hlo, hi = this.hhi;
@@ -879,22 +888,31 @@ var Engine = (function () {
 
   // ---- Recherche ----
   var TT_BITS = 19, TT_SIZE = 1 << TT_BITS, TT_MASK = TT_SIZE - 1;
-  var ttKey = new Int32Array(TT_SIZE), ttMove = new Int32Array(TT_SIZE), ttScore = new Int16Array(TT_SIZE), ttDepth = new Int8Array(TT_SIZE), ttFlag = new Int8Array(TT_SIZE);
+  // allouée à la première recherche : le fil principal, qui ne calcule pas, n'en paie pas la mémoire
+  var ttKey = null, ttMove, ttScore, ttDepth, ttFlag;
+  function ensureTT() {
+    if (ttKey) return;
+    ttKey = new Int32Array(TT_SIZE); ttMove = new Int32Array(TT_SIZE); ttScore = new Int16Array(TT_SIZE); ttDepth = new Int8Array(TT_SIZE); ttFlag = new Int8Array(TT_SIZE);
+  }
   var killers = new Int32Array(128 * 2), history = new Int32Array(16 * 128);
   var S = { nodes: 0, stop: false, deadline: 0, maxNodes: 0 };
 
-  function clearTT() { ttKey.fill(0); ttFlag.fill(0); }
+  function clearTT() { if (ttKey) { ttKey.fill(0); ttFlag.fill(0); } }
   function now() { return (typeof performance !== 'undefined' ? performance.now() : Date.now()); }
 
+  // tampons réutilisés à chaque profondeur (aucune allocation par nœud)
+  var MV_BUF = [], SC_BUF = [];
+  function mvBuf(ply) { var a = MV_BUF[ply] || (MV_BUF[ply] = []); a.length = 0; return a; }
   function scoreMoves(pos, moves, ttm, ply) {
-    var b = pos.b, sc = new Int32Array(moves.length);
+    var b = pos.b, sc = SC_BUF[ply] || (SC_BUF[ply] = new Int32Array(256));
+    var kp = (ply > 127 ? 127 : ply) * 2;
     for (var i = 0; i < moves.length; i++) {
       var m = moves[i], fl = mFlags(m);
       if (m === ttm) sc[i] = 10000000;
       else if (fl & F_CAP) { var v = (fl & F_EP) ? 100 : VAL[b[mTo(m)] & 7]; sc[i] = 1000000 + v * 10 - VAL[b[mFrom(m)] & 7] / 10; }
       else if (mPromo(m)) sc[i] = 900000 + mPromo(m);
-      else if (killers[ply * 2] === m) sc[i] = 800000;
-      else if (killers[ply * 2 + 1] === m) sc[i] = 700000;
+      else if (killers[kp] === m) sc[i] = 800000;
+      else if (killers[kp + 1] === m) sc[i] = 700000;
       else sc[i] = history[b[mFrom(m)] * 128 + mTo(m)];
     }
     return sc;
@@ -918,7 +936,7 @@ var Engine = (function () {
     if (stand >= beta) return stand;
     if (stand > alpha) alpha = stand;
     if (ply > 60) return stand;
-    var moves = pos.gen([], true), sc = scoreMoves(pos, moves, 0, Math.min(ply, 127)), us = pos.turn;
+    var moves = pos.gen(mvBuf(ply), true), sc = scoreMoves(pos, moves, 0, ply), us = pos.turn;
     for (var i = 0; i < moves.length; i++) {
       var m = pick(moves, sc, i);
       var capV = (mFlags(m) & F_EP) ? 100 : VAL[pos.b[mTo(m)] & 7];
@@ -971,7 +989,7 @@ var Engine = (function () {
       if (S.stop) return 0;
       if (ns >= beta) return ns > MATE - 500 ? beta : ns;
     }
-    var moves = pos.gen([], false), sc = scoreMoves(pos, moves, ttm, Math.min(ply, 127));
+    var moves = pos.gen(mvBuf(ply), false), sc = scoreMoves(pos, moves, ttm, ply);
     var best = -INF, bestM = 0, legalN = 0, a0 = alpha;
     for (var i = 0; i < moves.length; i++) {
       var m = pick(moves, sc, i);
@@ -1001,7 +1019,8 @@ var Engine = (function () {
             if (quiet) {
               var kp = Math.min(ply, 127) * 2;
               if (killers[kp] !== m) { killers[kp + 1] = killers[kp]; killers[kp] = m; }
-              history[pos.b[mFrom(m)] * 128 + mTo(m)] += depth * depth;
+              var hk = pos.b[mFrom(m)] * 128 + mTo(m);
+              if ((history[hk] += depth * depth) > 600000) for (var hh = 0; hh < history.length; hh++) history[hh] >>= 1;
             }
             break;
           }
@@ -1034,6 +1053,7 @@ var Engine = (function () {
   function search(pos, opt) {
     opt = opt || {};
     var maxD = opt.depth || 64, t0 = now();
+    ensureTT();
     S.nodes = 0; S.stop = false; S.deadline = opt.time ? t0 + opt.time : 0; S.maxNodes = opt.nodes || 0;
     killers.fill(0); for (var h = 0; h < history.length; h++) history[h] >>= 2;
     var L = pos.legal();
@@ -1058,746 +1078,15 @@ var Engine = (function () {
 
   /* évalue tous les coups racine à profondeur fixe (pour bots faibles / analyse) */
   function rootScores(pos, depth, time) {
-    var L = pos.legal(), out = [], t0 = now();
+    var L = pos.legal(), out = [], t0 = now(), late = false;
+    ensureTT();
     S.nodes = 0; S.stop = false; S.deadline = time ? t0 + time : 0; S.maxNodes = 0;
     for (var i = 0; i < L.length; i++) {
       pos.make(L[i]);
-      var s = depth <= 1 ? -quiesce(pos, -INF, INF, 1) : -negamax(pos, depth - 1, -INF, INF, 1, true);
+      var s = (depth <= 1 || late) ? -quiesce(pos, -INF, INF, 1) : -negamax(pos, depth - 1, -INF, INF, 1, true);
+      // délai dépassé : ce coup et les suivants sont évalués par la seule recherche de calme (rapide, bon signe)
+      if (S.stop) { late = true; S.stop = false; S.deadline = 0; s = -quiesce(pos, -INF, INF, 1); }
       pos.unmake();
-      if (S.stop) { s = -pos.evaluate(); S.stop = false; S.deadline = 0; }
-      out.push({ move: L[i], score: s });
-    }
-    out.sort(function (a, b) { return b.score - a.score; });
-    return out;
-  }
-
-  function perft(pos, d) {
-    if (d === 0) return 1;
-    var L = pos.gen([], false), n = 0, us = pos.turn;
-    for (var i = 0; i < L.length; i++) {
-      pos.make(L[i]);
-      if (!pos.attacked(pos.kings[us], us ^ 1)) n += perft(pos, d - 1);
-      pos.unmake();
-    }
-    return n;
-  }
-
-  return {
-    Pos: Pos, search: search, rootScores: rootScores, perft: perft, clearTT: clearTT,
-    mFrom: mFrom, mTo: mTo, mPromo: mPromo, mFlags: mFlags, uci: uci, sqName: sqName, sqParse: sqParse,
-    F_CAP: F_CAP, F_EP: F_EP, F_CASTLE: F_CASTLE, F_DOUBLE: F_DOUBLE, MATE: MATE, VAL: VAL,
-    START: 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1'
-  };
-})();
-if (typeof module !== 'undefined') module.exports = Engine;
-</script>
-<script>/* ===== Moteur d'échecs : règles + recherche (0x88) ===== */
-var Engine = (function () {
-  'use strict';
-  var PAWN = 1, KNIGHT = 2, BISHOP = 3, ROOK = 4, QUEEN = 5, KING = 6;
-  var N_OFF = [33, 31, 18, 14, -33, -31, -18, -14];
-  var B_OFF = [17, 15, -17, -15];
-  var R_OFF = [16, 1, -16, -1];
-  var K_OFF = [17, 15, -17, -15, 16, 1, -16, -1];
-  var F_CAP = 1, F_EP = 2, F_CASTLE = 4, F_DOUBLE = 8;
-  var VAL = [0, 100, 320, 330, 500, 900, 20000];
-  var MATE = 30000, INF = 32000;
-
-  function mv(from, to, promo, fl) { return from | (to << 7) | (promo << 14) | (fl << 17); }
-  function mFrom(m) { return m & 127; }
-  function mTo(m) { return (m >> 7) & 127; }
-  function mPromo(m) { return (m >> 14) & 7; }
-  function mFlags(m) { return m >>> 17; }
-
-  // ---- Zobrist ----
-  var seed = 0x9e3779b9;
-  function rnd() { seed ^= seed << 13; seed ^= seed >>> 17; seed ^= seed << 5; return seed | 0; }
-  var ZP_LO = new Int32Array(16 * 128), ZP_HI = new Int32Array(16 * 128);
-  var ZC_LO = new Int32Array(16), ZC_HI = new Int32Array(16);
-  var ZE_LO = new Int32Array(128), ZE_HI = new Int32Array(128);
-  for (var i = 0; i < 16 * 128; i++) { ZP_LO[i] = rnd(); ZP_HI[i] = rnd(); }
-  for (i = 0; i < 16; i++) { ZC_LO[i] = rnd(); ZC_HI[i] = rnd(); }
-  for (i = 0; i < 128; i++) { ZE_LO[i] = rnd(); ZE_HI[i] = rnd(); }
-  var ZT_LO = rnd(), ZT_HI = rnd();
-
-  var CASTLE_MASK = new Int32Array(128);
-  for (i = 0; i < 128; i++) CASTLE_MASK[i] = 15;
-  CASTLE_MASK[0] = 15 & ~2; CASTLE_MASK[7] = 15 & ~1; CASTLE_MASK[4] = 15 & ~3;
-  CASTLE_MASK[112] = 15 & ~8; CASTLE_MASK[119] = 15 & ~4; CASTLE_MASK[116] = 15 & ~12;
-
-  var FILES = 'abcdefgh';
-  function sqName(s) { return FILES[s & 7] + ((s >> 4) + 1); }
-  function sqParse(n) { return (n.charCodeAt(1) - 49) * 16 + (n.charCodeAt(0) - 97); }
-  var PCH = ' pnbrqk';
-
-  var STACK = 2048;
-  function Pos() {
-    this.b = new Int8Array(128);
-    this.turn = 0; this.castle = 0; this.ep = -1; this.half = 0; this.full = 1;
-    this.kings = [4, 116]; this.hlo = 0; this.hhi = 0;
-    this.sp = 0;
-    this.stM = new Int32Array(STACK); this.stCap = new Int8Array(STACK);
-    this.stCastle = new Int8Array(STACK); this.stEp = new Int16Array(STACK);
-    this.stHalf = new Int16Array(STACK); this.stLo = new Int32Array(STACK); this.stHi = new Int32Array(STACK);
-  }
-  var P = Pos.prototype;
-
-  P.epHashable = function () {
-    // la case e.p. n'est hachée que si une prise e.p. est géométriquement possible
-    if (this.ep < 0) return false;
-    var b = this.b, ep = this.ep;
-    if (this.turn === 0) { var p = 1; return (!((ep - 15) & 0x88) && b[ep - 15] === p) || (!((ep - 17) & 0x88) && b[ep - 17] === p); }
-    var q = 9; return (!((ep + 15) & 0x88) && b[ep + 15] === q) || (!((ep + 17) & 0x88) && b[ep + 17] === q);
-  };
-
-  P.computeHash = function () {
-    var lo = 0, hi = 0, b = this.b;
-    for (var s = 0; s < 128; s++) { if (s & 0x88) { s += 7; continue; } if (b[s]) { lo ^= ZP_LO[b[s] * 128 + s]; hi ^= ZP_HI[b[s] * 128 + s]; } }
-    lo ^= ZC_LO[this.castle]; hi ^= ZC_HI[this.castle];
-    if (this.epHashable()) { lo ^= ZE_LO[this.ep]; hi ^= ZE_HI[this.ep]; }
-    if (this.turn) { lo ^= ZT_LO; hi ^= ZT_HI; }
-    this.hlo = lo; this.hhi = hi;
-  };
-
-  P.load = function (fen) {
-    var parts = fen.trim().split(/\s+/);
-    var b = this.b; b.fill(0);
-    var rows = parts[0].split('/');
-    if (rows.length !== 8) throw new Error('FEN invalide');
-    for (var r = 0; r < 8; r++) {
-      var f = 0, row = rows[r];
-      for (var k = 0; k < row.length; k++) {
-        var c = row[k];
-        if (c >= '1' && c <= '8') { f += +c; continue; }
-        var t = PCH.indexOf(c.toLowerCase()); if (t < 1) throw new Error('FEN invalide');
-        var col = c === c.toLowerCase() ? 1 : 0;
-        var sq = (7 - r) * 16 + f; b[sq] = t | (col << 3);
-        if (t === KING) this.kings[col] = sq;
-        f++;
-      }
-    }
-    this.turn = parts[1] === 'b' ? 1 : 0;
-    var cs = parts[2] || '-'; this.castle = 0;
-    if (cs.indexOf('K') >= 0) this.castle |= 1; if (cs.indexOf('Q') >= 0) this.castle |= 2;
-    if (cs.indexOf('k') >= 0) this.castle |= 4; if (cs.indexOf('q') >= 0) this.castle |= 8;
-    this.ep = (parts[3] && parts[3] !== '-') ? sqParse(parts[3]) : -1;
-    this.half = parseInt(parts[4] || '0', 10) || 0;
-    this.full = parseInt(parts[5] || '1', 10) || 1;
-    this.sp = 0; this.computeHash();
-    return this;
-  };
-
-  P.fen = function () {
-    var s = '', b = this.b;
-    for (var r = 7; r >= 0; r--) {
-      var e = 0;
-      for (var f = 0; f < 8; f++) {
-        var p = b[r * 16 + f];
-        if (!p) { e++; continue; }
-        if (e) { s += e; e = 0; }
-        var ch = PCH[p & 7]; s += (p >> 3) ? ch : ch.toUpperCase();
-      }
-      if (e) s += e; if (r) s += '/';
-    }
-    var c = '';
-    if (this.castle & 1) c += 'K'; if (this.castle & 2) c += 'Q'; if (this.castle & 4) c += 'k'; if (this.castle & 8) c += 'q';
-    return s + ' ' + (this.turn ? 'b' : 'w') + ' ' + (c || '-') + ' ' + (this.epHashable() ? sqName(this.ep) : '-') + ' ' + this.half + ' ' + this.full;
-  };
-
-  P.clone = function () { var p = new Pos(); p.load(this.fen()); return p; };
-
-  P.attacked = function (sq, by) {
-    var b = this.b, t, i, d, s, p;
-    if (by === 0) {
-      t = sq - 15; if (!(t & 0x88) && b[t] === 1) return true;
-      t = sq - 17; if (!(t & 0x88) && b[t] === 1) return true;
-    } else {
-      t = sq + 15; if (!(t & 0x88) && b[t] === 9) return true;
-      t = sq + 17; if (!(t & 0x88) && b[t] === 9) return true;
-    }
-    var cb = by << 3;
-    for (i = 0; i < 8; i++) { t = sq + N_OFF[i]; if (!(t & 0x88) && b[t] === (KNIGHT | cb)) return true; }
-    for (i = 0; i < 8; i++) { t = sq + K_OFF[i]; if (!(t & 0x88) && b[t] === (KING | cb)) return true; }
-    for (i = 0; i < 4; i++) {
-      d = B_OFF[i]; s = sq + d;
-      while (!(s & 0x88)) { p = b[s]; if (p) { if (p === (BISHOP | cb) || p === (QUEEN | cb)) return true; break; } s += d; }
-      d = R_OFF[i]; s = sq + d;
-      while (!(s & 0x88)) { p = b[s]; if (p) { if (p === (ROOK | cb) || p === (QUEEN | cb)) return true; break; } s += d; }
-    }
-    return false;
-  };
-
-  // liste des cases attaquant sq pour la couleur by
-  P.attackers = function (sq, by) {
-    var b = this.b, out = [], t, i, d, s, p, cb = by << 3;
-    if (by === 0) { t = sq - 15; if (!(t & 0x88) && b[t] === 1) out.push(t); t = sq - 17; if (!(t & 0x88) && b[t] === 1) out.push(t); }
-    else { t = sq + 15; if (!(t & 0x88) && b[t] === 9) out.push(t); t = sq + 17; if (!(t & 0x88) && b[t] === 9) out.push(t); }
-    for (i = 0; i < 8; i++) { t = sq + N_OFF[i]; if (!(t & 0x88) && b[t] === (KNIGHT | cb)) out.push(t); }
-    for (i = 0; i < 8; i++) { t = sq + K_OFF[i]; if (!(t & 0x88) && b[t] === (KING | cb)) out.push(t); }
-    for (i = 0; i < 4; i++) {
-      d = B_OFF[i]; s = sq + d;
-      while (!(s & 0x88)) { p = b[s]; if (p) { if (p === (BISHOP | cb) || p === (QUEEN | cb)) out.push(s); break; } s += d; }
-      d = R_OFF[i]; s = sq + d;
-      while (!(s & 0x88)) { p = b[s]; if (p) { if (p === (ROOK | cb) || p === (QUEEN | cb)) out.push(s); break; } s += d; }
-    }
-    return out;
-  };
-
-  P.inCheck = function () { return this.attacked(this.kings[this.turn], this.turn ^ 1); };
-
-  P.gen = function (out, capsOnly) {
-    var b = this.b, us = this.turn, them = us ^ 1, cu = us << 3, n = out.length;
-    for (var s = 0; s < 128; s++) {
-      if (s & 0x88) { s += 7; continue; }
-      var p = b[s]; if (!p || (p >> 3) !== us) continue;
-      var t = p & 7, to, q, i, d;
-      if (t === PAWN) {
-        var dir = us ? -16 : 16, startR = us ? 6 : 1, promR = us ? 0 : 7;
-        to = s + dir;
-        if (!capsOnly || (to >> 4) === promR) {
-          if (!(to & 0x88) && !b[to]) {
-            if ((to >> 4) === promR) { for (q = QUEEN; q >= KNIGHT; q--) out[n++] = mv(s, to, q, 0); }
-            else {
-              out[n++] = mv(s, to, 0, 0);
-              if ((s >> 4) === startR && !b[to + dir]) out[n++] = mv(s, to + dir, 0, F_DOUBLE);
-            }
-          }
-        }
-        for (i = -1; i <= 1; i += 2) {
-          to = s + dir + i; if (to & 0x88) continue;
-          var c = b[to];
-          if (c && (c >> 3) === them) {
-            if ((to >> 4) === promR) { for (q = QUEEN; q >= KNIGHT; q--) out[n++] = mv(s, to, q, F_CAP); }
-            else out[n++] = mv(s, to, 0, F_CAP);
-          } else if (to === this.ep) out[n++] = mv(s, to, 0, F_CAP | F_EP);
-        }
-      } else if (t === KNIGHT || t === KING) {
-        var offs = t === KNIGHT ? N_OFF : K_OFF;
-        for (i = 0; i < 8; i++) {
-          to = s + offs[i]; if (to & 0x88) continue;
-          var c2 = b[to];
-          if (!c2) { if (!capsOnly) out[n++] = mv(s, to, 0, 0); }
-          else if ((c2 >> 3) === them) out[n++] = mv(s, to, 0, F_CAP);
-        }
-        if (t === KING && !capsOnly) {
-          if (us === 0 && s === 4) {
-            if ((this.castle & 1) && b[7] === 4 && !b[5] && !b[6] && !this.attacked(4, 1) && !this.attacked(5, 1) && !this.attacked(6, 1)) out[n++] = mv(4, 6, 0, F_CASTLE);
-            if ((this.castle & 2) && b[0] === 4 && !b[3] && !b[2] && !b[1] && !this.attacked(4, 1) && !this.attacked(3, 1) && !this.attacked(2, 1)) out[n++] = mv(4, 2, 0, F_CASTLE);
-          } else if (us === 1 && s === 116) {
-            if ((this.castle & 4) && b[119] === 12 && !b[117] && !b[118] && !this.attacked(116, 0) && !this.attacked(117, 0) && !this.attacked(118, 0)) out[n++] = mv(116, 118, 0, F_CASTLE);
-            if ((this.castle & 8) && b[112] === 12 && !b[115] && !b[114] && !b[113] && !this.attacked(116, 0) && !this.attacked(115, 0) && !this.attacked(114, 0)) out[n++] = mv(116, 114, 0, F_CASTLE);
-          }
-        }
-      } else {
-        var dirs = t === BISHOP ? B_OFF : t === ROOK ? R_OFF : K_OFF;
-        for (i = 0; i < dirs.length; i++) {
-          d = dirs[i]; to = s + d;
-          while (!(to & 0x88)) {
-            var c3 = b[to];
-            if (!c3) { if (!capsOnly) out[n++] = mv(s, to, 0, 0); }
-            else { if ((c3 >> 3) === them) out[n++] = mv(s, to, 0, F_CAP); break; }
-            to += d;
-          }
-        }
-      }
-    }
-    out.length = n;
-    return out;
-  };
-
-  P.make = function (m) {
-    var b = this.b, from = m & 127, to = (m >> 7) & 127, promo = (m >> 14) & 7, fl = m >>> 17;
-    var p = b[from], cap = b[to], us = this.turn, i = this.sp++;
-    this.stM[i] = m; this.stCastle[i] = this.castle; this.stEp[i] = this.ep; this.stHalf[i] = this.half;
-    this.stLo[i] = this.hlo; this.stHi[i] = this.hhi;
-    var lo = this.hlo, hi = this.hhi;
-    if (this.epHashable()) { lo ^= ZE_LO[this.ep]; hi ^= ZE_HI[this.ep]; }
-    lo ^= ZC_LO[this.castle]; hi ^= ZC_HI[this.castle];
-    lo ^= ZP_LO[p * 128 + from]; hi ^= ZP_HI[p * 128 + from];
-    if (fl & F_EP) {
-      var cs = to + (us === 0 ? -16 : 16); cap = b[cs]; b[cs] = 0;
-      lo ^= ZP_LO[cap * 128 + cs]; hi ^= ZP_HI[cap * 128 + cs];
-    } else if (cap) { lo ^= ZP_LO[cap * 128 + to]; hi ^= ZP_HI[cap * 128 + to]; }
-    this.stCap[i] = cap;
-    var np = promo ? (promo | (us << 3)) : p;
-    b[to] = np; b[from] = 0;
-    lo ^= ZP_LO[np * 128 + to]; hi ^= ZP_HI[np * 128 + to];
-    if (fl & F_CASTLE) {
-      var rf, rt;
-      if (to > from) { rf = from + 3; rt = from + 1; } else { rf = from - 4; rt = from - 1; }
-      var r = b[rf]; b[rt] = r; b[rf] = 0;
-      lo ^= ZP_LO[r * 128 + rf] ^ ZP_LO[r * 128 + rt]; hi ^= ZP_HI[r * 128 + rf] ^ ZP_HI[r * 128 + rt];
-    }
-    if ((p & 7) === KING) this.kings[us] = to;
-    this.castle &= CASTLE_MASK[from] & CASTLE_MASK[to];
-    this.ep = (fl & F_DOUBLE) ? (from + to) >> 1 : -1;
-    this.half = ((p & 7) === PAWN || cap) ? 0 : this.half + 1;
-    if (us === 1) this.full++;
-    this.turn = us ^ 1; lo ^= ZT_LO; hi ^= ZT_HI;
-    lo ^= ZC_LO[this.castle]; hi ^= ZC_HI[this.castle];
-    if (this.epHashable()) { lo ^= ZE_LO[this.ep]; hi ^= ZE_HI[this.ep]; }
-    this.hlo = lo; this.hhi = hi;
-  };
-
-  P.unmake = function () {
-    var i = --this.sp, m = this.stM[i], b = this.b;
-    var from = m & 127, to = (m >> 7) & 127, promo = (m >> 14) & 7, fl = m >>> 17;
-    this.turn ^= 1; var us = this.turn;
-    if (us === 1) this.full--;
-    var p = b[to]; if (promo) p = PAWN | (us << 3);
-    b[from] = p;
-    if (fl & F_EP) { b[to] = 0; b[to + (us === 0 ? -16 : 16)] = this.stCap[i]; }
-    else b[to] = this.stCap[i];
-    if (fl & F_CASTLE) {
-      var rf, rt;
-      if (to > from) { rf = from + 3; rt = from + 1; } else { rf = from - 4; rt = from - 1; }
-      b[rf] = b[rt]; b[rt] = 0;
-    }
-    if ((p & 7) === KING) this.kings[us] = from;
-    this.castle = this.stCastle[i]; this.ep = this.stEp[i]; this.half = this.stHalf[i];
-    this.hlo = this.stLo[i]; this.hhi = this.stHi[i];
-  };
-
-  P.makeNull = function () {
-    var i = this.sp++;
-    this.stM[i] = 0; this.stCastle[i] = this.castle; this.stEp[i] = this.ep; this.stHalf[i] = this.half;
-    this.stLo[i] = this.hlo; this.stHi[i] = this.hhi; this.stCap[i] = 0;
-    var lo = this.hlo, hi = this.hhi;
-    if (this.epHashable()) { lo ^= ZE_LO[this.ep]; hi ^= ZE_HI[this.ep]; }
-    this.ep = -1; this.turn ^= 1; lo ^= ZT_LO; hi ^= ZT_HI; this.half++;
-    this.hlo = lo; this.hhi = hi;
-  };
-  P.unmakeNull = function () {
-    var i = --this.sp; this.turn ^= 1;
-    this.castle = this.stCastle[i]; this.ep = this.stEp[i]; this.half = this.stHalf[i];
-    this.hlo = this.stLo[i]; this.hhi = this.stHi[i];
-  };
-
-  P.legal = function () {
-    var ps = this.gen([], false), out = [], us = this.turn;
-    for (var i = 0; i < ps.length; i++) {
-      this.make(ps[i]);
-      if (!this.attacked(this.kings[us], us ^ 1)) out.push(ps[i]);
-      this.unmake();
-    }
-    return out;
-  };
-
-  P.isRepetition = function (times) {
-    // nombre d'occurrences antérieures de la position actuelle
-    var c = 0;
-    for (var i = this.sp - 2; i >= 0 && i >= this.sp - this.half - 1; i -= 2) {
-      if (this.stLo[i] === this.hlo && this.stHi[i] === this.hhi) { c++; if (c >= times) return true; }
-    }
-    return false;
-  };
-
-  P.insufficient = function () {
-    var b = this.b, minors = 0, bish = [], other = 0;
-    for (var s = 0; s < 128; s++) {
-      if (s & 0x88) { s += 7; continue; }
-      var t = b[s] & 7; if (!t || t === KING) continue;
-      if (t === KNIGHT) minors++;
-      else if (t === BISHOP) { minors++; bish.push(((s >> 4) + (s & 7)) & 1); }
-      else other++;
-    }
-    if (other) return false;
-    if (minors <= 1) return true;
-    if (minors === bish.length) { for (var i = 1; i < bish.length; i++) if (bish[i] !== bish[0]) return false; return true; }
-    return false;
-  };
-
-  // ---- Notation SAN ----
-  P.san = function (m, legalList) {
-    var b = this.b, from = mFrom(m), to = mTo(m), fl = mFlags(m), p = b[from], t = p & 7, s;
-    if (fl & F_CASTLE) s = to > from ? 'O-O' : 'O-O-O';
-    else {
-      s = '';
-      if (t === PAWN) {
-        if (fl & F_CAP) s = FILES[from & 7] + 'x';
-        s += sqName(to);
-        if (mPromo(m)) s += '=' + PCH[mPromo(m)].toUpperCase();
-      } else {
-        s = PCH[t].toUpperCase();
-        var L = legalList || this.legal(), sameF = false, sameR = false, amb = false;
-        for (var i = 0; i < L.length; i++) {
-          var o = L[i]; if (o === m) continue;
-          if (mTo(o) === to && (b[mFrom(o)] === p)) {
-            amb = true;
-            if ((mFrom(o) & 7) === (from & 7)) sameF = true;
-            if ((mFrom(o) >> 4) === (from >> 4)) sameR = true;
-          }
-        }
-        if (amb) {
-          if (!sameF) s += FILES[from & 7];
-          else if (!sameR) s += ((from >> 4) + 1);
-          else s += sqName(from);
-        }
-        if (fl & F_CAP) s += 'x';
-        s += sqName(to);
-      }
-    }
-    this.make(m);
-    if (this.inCheck()) s += this.legal().length ? '+' : '#';
-    this.unmake();
-    return s;
-  };
-
-  P.parseMove = function (str) {
-    str = String(str).trim().replace(/[!?]+$/, '').replace(/0/g, 'O').replace(/[+#]$/, '');
-    var L = this.legal(), i;
-    if (/^[a-h][1-8][a-h][1-8][qrbn]?$/.test(str)) {
-      var f = sqParse(str.slice(0, 2)), t = sqParse(str.slice(2, 4)), pr = str[4] ? PCH.indexOf(str[4]) : 0;
-      for (i = 0; i < L.length; i++) if (mFrom(L[i]) === f && mTo(L[i]) === t && mPromo(L[i]) === pr) return L[i];
-      return 0;
-    }
-    for (i = 0; i < L.length; i++) { if (this.san(L[i], L).replace(/[+#]$/, '') === str) return L[i]; }
-    // tolérance : promotion sans '='
-    var alt = str.replace(/([a-h][18])([QRBN])$/, '$1=$2');
-    if (alt !== str) for (i = 0; i < L.length; i++) { if (this.san(L[i], L).replace(/[+#]$/, '') === alt) return L[i]; }
-    // tolérance : désambiguïsation superflue (ex. Ncb4 quand un seul cavalier peut aller en b4)
-    var g = /^([NBRQK])([a-h])?([1-8])?x?([a-h][1-8])$/.exec(str);
-    if (g) {
-      var T = PCH.indexOf(g[1].toLowerCase()), to = sqParse(g[4]), hit = [];
-      for (i = 0; i < L.length; i++) {
-        var fr = mFrom(L[i]);
-        if (mTo(L[i]) !== to || (this.b[fr] & 7) !== T) continue;
-        if (g[2] && (fr & 7) !== g[2].charCodeAt(0) - 97) continue;
-        if (g[3] && (fr >> 4) !== +g[3] - 1) continue;
-        hit.push(L[i]);
-      }
-      if (hit.length === 1) return hit[0];
-    }
-    return 0;
-  };
-
-  function uci(m) { return sqName(mFrom(m)) + sqName(mTo(m)) + (mPromo(m) ? PCH[mPromo(m)] : ''); }
-
-  // ---- Évaluation ----
-  function T(a) { return a; }
-  var PST_MG = [null,
-    T([0,0,0,0,0,0,0,0, 50,50,50,50,50,50,50,50, 10,10,20,30,30,20,10,10, 5,5,10,25,25,10,5,5, 0,0,0,20,20,0,0,0, 5,-5,-10,0,0,-10,-5,5, 5,10,10,-20,-20,10,10,5, 0,0,0,0,0,0,0,0]),
-    T([-50,-40,-30,-30,-30,-30,-40,-50, -40,-20,0,0,0,0,-20,-40, -30,0,10,15,15,10,0,-30, -30,5,15,20,20,15,5,-30, -30,0,15,20,20,15,0,-30, -30,5,10,15,15,10,5,-30, -40,-20,0,5,5,0,-20,-40, -50,-40,-30,-30,-30,-30,-40,-50]),
-    T([-20,-10,-10,-10,-10,-10,-10,-20, -10,0,0,0,0,0,0,-10, -10,0,5,10,10,5,0,-10, -10,5,5,10,10,5,5,-10, -10,0,10,10,10,10,0,-10, -10,10,10,10,10,10,10,-10, -10,5,0,0,0,0,5,-10, -20,-10,-10,-10,-10,-10,-10,-20]),
-    T([0,0,0,0,0,0,0,0, 5,10,10,10,10,10,10,5, -5,0,0,0,0,0,0,-5, -5,0,0,0,0,0,0,-5, -5,0,0,0,0,0,0,-5, -5,0,0,0,0,0,0,-5, -5,0,0,0,0,0,0,-5, 0,0,0,5,5,0,0,0]),
-    T([-20,-10,-10,-5,-5,-10,-10,-20, -10,0,0,0,0,0,0,-10, -10,0,5,5,5,5,0,-10, -5,0,5,5,5,5,0,-5, 0,0,5,5,5,5,0,-5, -10,5,5,5,5,5,0,-10, -10,0,5,0,0,0,0,-10, -20,-10,-10,-5,-5,-10,-10,-20]),
-    T([-30,-40,-40,-50,-50,-40,-40,-30, -30,-40,-40,-50,-50,-40,-40,-30, -30,-40,-40,-50,-50,-40,-40,-30, -30,-40,-40,-50,-50,-40,-40,-30, -20,-30,-30,-40,-40,-30,-30,-20, -10,-20,-20,-20,-20,-20,-20,-10, 20,20,0,0,0,0,20,20, 20,30,10,0,0,10,30,20])
-  ];
-  var PST_EG = PST_MG.slice();
-  PST_EG[1] = T([0,0,0,0,0,0,0,0, 90,90,90,90,90,90,90,90, 55,55,55,55,55,55,55,55, 30,30,30,30,30,30,30,30, 15,15,15,15,15,15,15,15, 5,5,5,5,5,5,5,5, 0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0]);
-  PST_EG[6] = T([-50,-40,-30,-20,-20,-30,-40,-50, -30,-20,-10,0,0,-10,-20,-30, -30,-10,20,30,30,20,-10,-30, -30,-10,30,40,40,30,-10,-30, -30,-10,30,40,40,30,-10,-30, -30,-10,20,30,30,20,-10,-30, -30,-30,0,0,0,0,-30,-30, -50,-30,-30,-30,-30,-30,-30,-50]);
-  var PASSED_MG = [0, 5, 10, 15, 25, 40, 60, 0], PASSED_EG = [0, 10, 20, 35, 60, 95, 140, 0];
-  var PHASE_W = [0, 0, 1, 1, 2, 4, 0];
-  var wMin = new Int8Array(8), wMax = new Int8Array(8), bMin = new Int8Array(8), bMax = new Int8Array(8), wCnt = new Int8Array(8), bCnt = new Int8Array(8);
-
-  // renvoie l'évaluation du point de vue des Blancs
-  P.evalWhite = function () {
-    var b = this.b, mg = 0, eg = 0, phase = 0, s, p, t, c, r, f, idx, i;
-    var bishops = [0, 0], mat = [0, 0];
-    for (i = 0; i < 8; i++) { wMin[i] = 8; wMax[i] = -1; bMin[i] = 8; bMax[i] = -1; wCnt[i] = 0; bCnt[i] = 0; }
-    for (s = 0; s < 128; s++) {
-      if (s & 0x88) { s += 7; continue; }
-      p = b[s]; if (!p || (p & 7) !== PAWN) continue;
-      r = s >> 4; f = s & 7;
-      if (p === 1) { wCnt[f]++; if (r < wMin[f]) wMin[f] = r; if (r > wMax[f]) wMax[f] = r; }
-      else { bCnt[f]++; if (r < bMin[f]) bMin[f] = r; if (r > bMax[f]) bMax[f] = r; }
-    }
-    for (s = 0; s < 128; s++) {
-      if (s & 0x88) { s += 7; continue; }
-      p = b[s]; if (!p) continue;
-      t = p & 7; c = p >> 3; r = s >> 4; f = s & 7;
-      idx = c === 0 ? (7 - r) * 8 + f : r * 8 + f;
-      var sign = c === 0 ? 1 : -1;
-      var v = VAL[t];
-      if (t !== KING) mat[c] += v;
-      mg += sign * (v + PST_MG[t][idx]);
-      eg += sign * (v + PST_EG[t][idx]);
-      phase += PHASE_W[t];
-      if (t === BISHOP) bishops[c]++;
-      if (t === PAWN) {
-        var passed = true, isolated = true, k;
-        for (k = f - 1; k <= f + 1; k++) {
-          if (k < 0 || k > 7) continue;
-          if (c === 0) { if (bMax[k] > r) passed = false; if (k !== f && wCnt[k]) isolated = false; }
-          else { if (wMin[k] < r) passed = false; if (k !== f && bCnt[k]) isolated = false; }
-        }
-        if (passed) { var rr = c === 0 ? r : 7 - r; mg += sign * PASSED_MG[rr]; eg += sign * PASSED_EG[rr]; }
-        if (isolated) { mg -= sign * 10; eg -= sign * 15; }
-      } else if (t === ROOK) {
-        var own = c === 0 ? wCnt[f] : bCnt[f], opp = c === 0 ? bCnt[f] : wCnt[f];
-        if (!own) { mg += sign * (opp ? 10 : 22); eg += sign * (opp ? 5 : 10); }
-      }
-      if (t >= KNIGHT && t <= QUEEN) {
-        // mobilité légère
-        var mob = 0, offs, d, to, q;
-        if (t === KNIGHT) { for (i = 0; i < 8; i++) { to = s + N_OFF[i]; if (!(to & 0x88) && (!b[to] || (b[to] >> 3) !== c)) mob++; } mob -= 4; mg += sign * mob * 4; eg += sign * mob * 4; }
-        else {
-          offs = t === BISHOP ? B_OFF : t === ROOK ? R_OFF : K_OFF;
-          for (i = 0; i < offs.length; i++) { d = offs[i]; to = s + d; while (!(to & 0x88)) { q = b[to]; if (q) { if ((q >> 3) !== c) mob++; break; } mob++; to += d; } }
-          if (t === BISHOP) { mob -= 6; mg += sign * mob * 4; eg += sign * mob * 4; }
-          else if (t === ROOK) { mob -= 7; mg += sign * mob * 2; eg += sign * mob * 4; }
-          else { mob -= 13; mg += sign * mob * 1; eg += sign * mob * 2; }
-        }
-      }
-    }
-    // doublés
-    for (i = 0; i < 8; i++) { if (wCnt[i] > 1) { mg -= 12 * (wCnt[i] - 1); eg -= 20 * (wCnt[i] - 1); } if (bCnt[i] > 1) { mg += 12 * (bCnt[i] - 1); eg += 20 * (bCnt[i] - 1); } }
-    if (bishops[0] >= 2) { mg += 30; eg += 45; } if (bishops[1] >= 2) { mg -= 30; eg -= 45; }
-    // bouclier de pions du roi
-    for (c = 0; c < 2; c++) {
-      var ks = this.kings[c], kf = ks & 7, kr = ks >> 4, sh = 0, dirp = c === 0 ? 16 : -16, pw = c === 0 ? 1 : 9;
-      if ((c === 0 && kr <= 1) || (c === 1 && kr >= 6)) {
-        for (var df = -1; df <= 1; df++) {
-          var ff = kf + df; if (ff < 0 || ff > 7) continue;
-          var s1 = ks + dirp + df, s2 = ks + 2 * dirp + df;
-          if (!(s1 & 0x88) && b[s1] === pw) sh += 12; else if (!(s2 & 0x88) && b[s2] === pw) sh += 6; else sh -= 8;
-        }
-      }
-      mg += (c === 0 ? 1 : -1) * sh;
-    }
-    if (phase > 24) phase = 24;
-    var score = ((mg * phase) + (eg * (24 - phase))) / 24;
-    // finale : pousser le roi adverse au bord (mat élémentaire)
-    var diff = mat[0] - mat[1];
-    if (phase <= 8 && Math.abs(diff) >= 400) {
-      var strong = diff > 0 ? 0 : 1, wk = this.kings[strong], lk = this.kings[strong ^ 1];
-      var lf = lk & 7, lr = lk >> 4;
-      var cd = Math.max(3 - lf, lf - 4) + Math.max(3 - lr, lr - 4);
-      var kd = Math.abs((wk & 7) - lf) + Math.abs((wk >> 4) - lr);
-      var mu = 12 * cd + 5 * (14 - kd);
-      score += strong === 0 ? mu : -mu;
-    }
-    // réduction si matériel insuffisant pour mater
-    if (score > 0 && mat[0] < 400 && !this.hasPawns(0)) score = score / 8;
-    if (score < 0 && mat[1] < 400 && !this.hasPawns(1)) score = score / 8;
-    return score | 0;
-  };
-  P.hasPawns = function (c) { var b = this.b, pw = c ? 9 : 1; for (var s = 0; s < 128; s++) { if (s & 0x88) { s += 7; continue; } if (b[s] === pw) return true; } return false; };
-  P.nonPawn = function (c) { var b = this.b; for (var s = 0; s < 128; s++) { if (s & 0x88) { s += 7; continue; } var p = b[s]; if (p && (p >> 3) === c) { var t = p & 7; if (t !== PAWN && t !== KING) return true; } } return false; };
-  P.evaluate = function () { var e = this.evalWhite(); return (this.turn === 0 ? e : -e) + 10; };
-
-  P.material = function () {
-    var b = this.b, m = [0, 0], counts = [[0,0,0,0,0,0,0],[0,0,0,0,0,0,0]];
-    for (var s = 0; s < 128; s++) { if (s & 0x88) { s += 7; continue; } var p = b[s]; if (!p) continue; var t = p & 7; counts[p >> 3][t]++; if (t !== KING) m[p >> 3] += [0,1,3,3,5,9][t]; }
-    return { w: m[0], b: m[1], counts: counts };
-  };
-
-  // ---- Échange statique (SEE) sur une case ----
-  P.see = function (m) {
-    var b = this.b, from = mFrom(m), to = mTo(m);
-    var gain = [], d = 0, side = this.turn;
-    var saved = [];
-    var target = (mFlags(m) & F_EP) ? PAWN : (b[to] & 7);
-    gain[0] = target ? VAL[target] : 0;
-    var attacker = b[from];
-    var curVal = mPromo(m) ? VAL[mPromo(m)] : VAL[attacker & 7];
-    saved.push([from, b[from]]); b[from] = 0;
-    side ^= 1;
-    while (true) {
-      d++;
-      var att = this.attackers(to, side), best = -1, bv = 99999;
-      for (var i = 0; i < att.length; i++) { var v = VAL[b[att[i]] & 7]; if (v < bv) { bv = v; best = att[i]; } }
-      if (best < 0) break;
-      gain[d] = curVal - gain[d - 1];
-      if (Math.max(-gain[d - 1], gain[d]) < 0) break;
-      curVal = bv;
-      saved.push([best, b[best]]); b[best] = 0;
-      side ^= 1;
-      if (d > 30) break;
-    }
-    for (var j = saved.length - 1; j >= 0; j--) b[saved[j][0]] = saved[j][1];
-    while (--d > 0) gain[d - 1] = -Math.max(-gain[d - 1], gain[d]);
-    return gain[0];
-  };
-
-  // ---- Recherche ----
-  var TT_BITS = 19, TT_SIZE = 1 << TT_BITS, TT_MASK = TT_SIZE - 1;
-  var ttKey = new Int32Array(TT_SIZE), ttMove = new Int32Array(TT_SIZE), ttScore = new Int16Array(TT_SIZE), ttDepth = new Int8Array(TT_SIZE), ttFlag = new Int8Array(TT_SIZE);
-  var killers = new Int32Array(128 * 2), history = new Int32Array(16 * 128);
-  var S = { nodes: 0, stop: false, deadline: 0, maxNodes: 0 };
-
-  function clearTT() { ttKey.fill(0); ttFlag.fill(0); }
-  function now() { return (typeof performance !== 'undefined' ? performance.now() : Date.now()); }
-
-  function scoreMoves(pos, moves, ttm, ply) {
-    var b = pos.b, sc = new Int32Array(moves.length);
-    for (var i = 0; i < moves.length; i++) {
-      var m = moves[i], fl = mFlags(m);
-      if (m === ttm) sc[i] = 10000000;
-      else if (fl & F_CAP) { var v = (fl & F_EP) ? 100 : VAL[b[mTo(m)] & 7]; sc[i] = 1000000 + v * 10 - VAL[b[mFrom(m)] & 7] / 10; }
-      else if (mPromo(m)) sc[i] = 900000 + mPromo(m);
-      else if (killers[ply * 2] === m) sc[i] = 800000;
-      else if (killers[ply * 2 + 1] === m) sc[i] = 700000;
-      else sc[i] = history[b[mFrom(m)] * 128 + mTo(m)];
-    }
-    return sc;
-  }
-  function pick(moves, sc, i) {
-    var bi = i, bs = sc[i];
-    for (var j = i + 1; j < moves.length; j++) if (sc[j] > bs) { bs = sc[j]; bi = j; }
-    if (bi !== i) { var t = moves[i]; moves[i] = moves[bi]; moves[bi] = t; var u = sc[i]; sc[i] = sc[bi]; sc[bi] = u; }
-    return moves[i];
-  }
-  function checkTime() {
-    if ((S.nodes & 1023) === 0) {
-      if (S.deadline && now() > S.deadline) S.stop = true;
-      if (S.maxNodes && S.nodes > S.maxNodes) S.stop = true;
-    }
-  }
-
-  function quiesce(pos, alpha, beta, ply) {
-    S.nodes++; checkTime(); if (S.stop) return 0;
-    var stand = pos.evaluate();
-    if (stand >= beta) return stand;
-    if (stand > alpha) alpha = stand;
-    if (ply > 60) return stand;
-    var moves = pos.gen([], true), sc = scoreMoves(pos, moves, 0, Math.min(ply, 127)), us = pos.turn;
-    for (var i = 0; i < moves.length; i++) {
-      var m = pick(moves, sc, i);
-      var capV = (mFlags(m) & F_EP) ? 100 : VAL[pos.b[mTo(m)] & 7];
-      if (!mPromo(m) && stand + capV + 200 < alpha) continue; // delta
-      pos.make(m);
-      if (pos.attacked(pos.kings[us], us ^ 1)) { pos.unmake(); continue; }
-      var s = -quiesce(pos, -beta, -alpha, ply + 1);
-      pos.unmake();
-      if (S.stop) return 0;
-      if (s >= beta) return s;
-      if (s > alpha) alpha = s;
-    }
-    return alpha;
-  }
-
-  function negamax(pos, depth, alpha, beta, ply, allowNull) {
-    if (ply > 0) {
-      if (pos.half >= 100 || pos.isRepetition(1)) return 0;
-      // distance au mat
-      var ma = -MATE + ply, mb = MATE - ply - 1;
-      if (ma > alpha) { alpha = ma; if (beta <= ma) return ma; }
-      if (mb < beta) { beta = mb; if (alpha >= mb) return mb; }
-    }
-    var us = pos.turn, inCheck = pos.inCheck();
-    if (inCheck) depth++;
-    if (depth <= 0) return quiesce(pos, alpha, beta, ply);
-    S.nodes++; checkTime(); if (S.stop) return 0;
-    var pvNode = beta - alpha > 1;
-    var idx = pos.hlo & TT_MASK, ttm = 0;
-    if (ttKey[idx] === pos.hhi && ttFlag[idx]) {
-      ttm = ttMove[idx];
-      if (ttDepth[idx] >= depth && ply > 0 && !pvNode) {
-        var ts = ttScore[idx];
-        if (ts > MATE - 500) ts -= ply; else if (ts < -MATE + 500) ts += ply;
-        var tf = ttFlag[idx];
-        if (tf === 1) return ts;
-        if (tf === 2 && ts >= beta) return ts;
-        if (tf === 3 && ts <= alpha) return ts;
-      }
-    }
-    var staticEval = inCheck ? -INF : pos.evaluate();
-    // élagage « reverse futility »
-    if (!pvNode && !inCheck && depth <= 3 && staticEval - 120 * depth >= beta && Math.abs(beta) < MATE - 500) return staticEval;
-    // coup nul
-    if (!pvNode && allowNull && !inCheck && depth >= 3 && staticEval >= beta && pos.nonPawn(us)) {
-      pos.makeNull();
-      var R = depth > 6 ? 3 : 2;
-      var ns = -negamax(pos, depth - 1 - R, -beta, -beta + 1, ply + 1, false);
-      pos.unmakeNull();
-      if (S.stop) return 0;
-      if (ns >= beta) return ns > MATE - 500 ? beta : ns;
-    }
-    var moves = pos.gen([], false), sc = scoreMoves(pos, moves, ttm, Math.min(ply, 127));
-    var best = -INF, bestM = 0, legalN = 0, a0 = alpha;
-    for (var i = 0; i < moves.length; i++) {
-      var m = pick(moves, sc, i);
-      pos.make(m);
-      if (pos.attacked(pos.kings[us], us ^ 1)) { pos.unmake(); continue; }
-      legalN++;
-      var quiet = !(mFlags(m) & F_CAP) && !mPromo(m);
-      var givesCheck = pos.inCheck();
-      var s;
-      if (legalN === 1) s = -negamax(pos, depth - 1, -beta, -alpha, ply + 1, true);
-      else {
-        var red = 0;
-        if (depth >= 3 && quiet && !inCheck && !givesCheck && legalN > 3) red = legalN > 10 ? 2 : 1;
-        // élagage de futilité simple
-        if (!pvNode && depth <= 2 && quiet && !inCheck && !givesCheck && staticEval + 150 * depth < alpha && legalN > 1) { pos.unmake(); continue; }
-        s = -negamax(pos, depth - 1 - red, -alpha - 1, -alpha, ply + 1, true);
-        if (s > alpha && red) s = -negamax(pos, depth - 1, -alpha - 1, -alpha, ply + 1, true);
-        if (s > alpha && s < beta) s = -negamax(pos, depth - 1, -beta, -alpha, ply + 1, true);
-      }
-      pos.unmake();
-      if (S.stop) return 0;
-      if (s > best) {
-        best = s; bestM = m;
-        if (s > alpha) {
-          alpha = s;
-          if (s >= beta) {
-            if (quiet) {
-              var kp = Math.min(ply, 127) * 2;
-              if (killers[kp] !== m) { killers[kp + 1] = killers[kp]; killers[kp] = m; }
-              history[pos.b[mFrom(m)] * 128 + mTo(m)] += depth * depth;
-            }
-            break;
-          }
-        }
-      }
-    }
-    if (!legalN) return inCheck ? -MATE + ply : 0;
-    var store = best;
-    if (store > MATE - 500) store += ply; else if (store < -MATE + 500) store -= ply;
-    ttKey[idx] = pos.hhi; ttMove[idx] = bestM; ttScore[idx] = store; ttDepth[idx] = depth;
-    ttFlag[idx] = best >= beta ? 2 : best > a0 ? 1 : 3;
-    return best;
-  }
-
-  function extractPV(pos, maxLen) {
-    var pv = [], n = 0;
-    while (n < maxLen) {
-      var idx = pos.hlo & TT_MASK;
-      if (ttKey[idx] !== pos.hhi || !ttFlag[idx]) break;
-      var m = ttMove[idx]; if (!m) break;
-      var L = pos.legal(); if (L.indexOf(m) < 0) break;
-      pv.push(m); pos.make(m); n++;
-      if (pos.isRepetition(1)) break;
-    }
-    for (var i = 0; i < n; i++) pos.unmake();
-    return pv;
-  }
-
-  /* search(pos, {depth, time, nodes}) -> {move, score, depth, pv, nodes} ; score du point de vue du trait */
-  function search(pos, opt) {
-    opt = opt || {};
-    var maxD = opt.depth || 64, t0 = now();
-    S.nodes = 0; S.stop = false; S.deadline = opt.time ? t0 + opt.time : 0; S.maxNodes = opt.nodes || 0;
-    killers.fill(0); for (var h = 0; h < history.length; h++) history[h] >>= 2;
-    var L = pos.legal();
-    if (!L.length) return { move: 0, score: pos.inCheck() ? -MATE : 0, depth: 0, pv: [], nodes: 0 };
-    var bestM = L[0], bestS = 0, done = 0, pv = [];
-    for (var d = 1; d <= maxD; d++) {
-      var s = negamax(pos, d, -INF, INF, 0, false);
-      if (S.stop && d > 1) break;
-      var idx = pos.hlo & TT_MASK;
-      if (ttKey[idx] === pos.hhi && ttMove[idx] && L.indexOf(ttMove[idx]) >= 0) bestM = ttMove[idx];
-      bestS = s; done = d;
-      pv = extractPV(pos, Math.min(d + 4, 16));
-      if (!pv.length || pv[0] !== bestM) pv = [bestM];
-      if (opt.onInfo) opt.onInfo({ depth: d, score: s, pv: pv.slice(), nodes: S.nodes });
-      if (Math.abs(s) > MATE - 200 && d >= 4) break;
-      if (S.stop) break;
-      if (L.length === 1 && d >= 3) break;
-      if (S.deadline && now() - t0 > (S.deadline - t0) * 0.55) break;
-    }
-    return { move: bestM, score: bestS, depth: done, pv: pv, nodes: S.nodes };
-  }
-
-  /* évalue tous les coups racine à profondeur fixe (pour bots faibles / analyse) */
-  function rootScores(pos, depth, time) {
-    var L = pos.legal(), out = [], t0 = now();
-    S.nodes = 0; S.stop = false; S.deadline = time ? t0 + time : 0; S.maxNodes = 0;
-    for (var i = 0; i < L.length; i++) {
-      pos.make(L[i]);
-      var s = depth <= 1 ? -quiesce(pos, -INF, INF, 1) : -negamax(pos, depth - 1, -INF, INF, 1, true);
-      pos.unmake();
-      if (S.stop) { s = -pos.evaluate(); S.stop = false; S.deadline = 0; }
       out.push({ move: L[i], score: s });
     }
     out.sort(function (a, b) { return b.score - a.score; });
@@ -2246,13 +1535,14 @@ function h(tag, attrs) {
   }
   return el;
 }
+function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) { return '&#' + c.charCodeAt(0) + ';'; }); }
 function clamp(x, a, b) { return x < a ? a : x > b ? b : x; }
 function pickRand(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
 
 /* ---- Stockage local (tolérant) ---- */
 var Store = {
   get: function (k, d) { try { var v = localStorage.getItem('edp.' + k); return v == null ? d : JSON.parse(v); } catch (e) { return d; } },
-  set: function (k, v) { try { localStorage.setItem('edp.' + k, JSON.stringify(v)); } catch (e) { } },
+  set: function (k, v) { try { localStorage.setItem('edp.' + k, JSON.stringify(v)); return true; } catch (e) { return false; } },
   del: function (k) { try { localStorage.removeItem('edp.' + k); } catch (e) { } }
 };
 
@@ -2581,8 +1871,8 @@ Board.prototype.canPick = function (sq) {
   return false;
 };
 Board.prototype.canPremove = function (sq) { var p = this.map[sq]; return p && this.premovable && p[0] === this.premovable && App.settings.premove !== false; };
-Board.prototype.evSq = function (e) {
-  var r = this.root.getBoundingClientRect();
+Board.prototype.evSq = function (e, r) {
+  r = r || this.root.getBoundingClientRect();
   var x = Math.floor((e.clientX - r.left) / r.width * 8), y = Math.floor((e.clientY - r.top) / r.height * 8);
   return this.sqAt(x, y);
 };
@@ -2626,7 +1916,7 @@ Board.prototype.moveP = function (e) {
   var x = (e.clientX - r.left - s / 2) / s * 100, y = (e.clientY - r.top - s / 2) / s * 100;
   if (e.pointerType === 'touch') y -= 45; // garder la pièce visible sous le doigt
   d.el.style.transform = 'translate(' + x + '%,' + y + '%) scale(1.12)';
-  var hs = this.evSq(e.pointerType === 'touch' ? { clientX: e.clientX, clientY: e.clientY - s * 0.45 } : e);
+  var hs = this.evSq(e.pointerType === 'touch' ? { clientX: e.clientX, clientY: e.clientY - s * 0.45 } : e, r);
   if (hs !== this.hover) { this.hover = hs; this.renderHL(); }
 };
 Board.prototype.up = function (e) {
@@ -2977,13 +2267,16 @@ function engineHandle(d, post) {
   } catch (err) { post({ id: d.id, error: String(err && err.message || err) }); }
 }
 
+var ENGINE_URL = null;
 var EngineProto = {
   init: function () {
-    var self = this;
+    var self = this; this.tried = true;
     try {
-      var src = document.getElementById('engine-src').textContent + '\n' + engineHandle.toString() + '\nself.onmessage=function(e){engineHandle(e.data,function(r){self.postMessage(r)})};';
-      var url = URL.createObjectURL(new Blob([src], { type: 'application/javascript' }));
-      this.w = new Worker(url);
+      if (!ENGINE_URL) {
+        var src = document.getElementById('engine-src').textContent + '\n' + engineHandle.toString() + '\nself.onmessage=function(e){engineHandle(e.data,function(r){self.postMessage(r)})};';
+        ENGINE_URL = URL.createObjectURL(new Blob([src], { type: 'application/javascript' }));
+      }
+      this.w = new Worker(ENGINE_URL);
       this.w.onmessage = function (e) { self.recv(e.data); };
       this.w.onerror = function (e) { e.preventDefault && e.preventDefault(); self.fallback(); };
       this.ok = true;
@@ -3012,6 +2305,7 @@ var EngineProto = {
   req: function (msg, onProgress) {
     var self = this;
     return new Promise(function (res, rej) {
+      if (!self.tried) self.init(); // worker créé au premier besoin
       msg.id = ++self.seq;
       var it = { res: res, rej: rej, msg: msg, onProgress: onProgress };
       if (self.w) { self.pend[msg.id] = it; self.w.postMessage(msg); }
@@ -3147,7 +2441,13 @@ var App = {
   history: Store.get('history', []),
   screen: null, cleanup: null, stack: [],
   save: function () { Store.set('settings', this.settings); Store.set('profile', this.profile); },
-  saveHistory: function () { if (this.history.length > 60) this.history = this.history.slice(-60); Store.set('history', this.history); },
+  saveHistory: function () {
+    if (this.history.length > 60) this.history = this.history.slice(-60);
+    // stockage plein : on abandonne les analyses des parties les plus anciennes (recalculées à la demande)
+    if (!Store.set('history', this.history) && Store.set('probe', 1)) {
+      for (var i = 0; i < this.history.length; i++) { if (!this.history[i].review) continue; delete this.history[i].review; if (Store.set('history', this.history)) break; }
+    }
+  },
   animMs: function () { return { none: 0, fast: 110, normal: 190, slow: 320 }[this.settings.anim] || 190; },
   applyLook: function () {
     var t = THEMES[this.settings.theme] || THEMES.green, r = document.documentElement.style;
@@ -3505,15 +2805,18 @@ function Game(cfg) {
     this.say({ who: 'bot', text: this.script ? 'Je rejoue les coups de ton adversaire : à toi de retrouver les tiens, ou d\'en essayer de meilleurs. Si tu t\'écartes de la partie, je continue librement.' : this.mode === 'coach' ? TEACHER.hi[0] : this.bot.hi[0] });
   }
   if (this.mode === 'practice') this.say({ who: 'bot', text: this.practice.title + ' — objectif : ' + (this.practice.goal === 'mate' ? 'mater' : 'promouvoir un pion') + (this.practice.limit ? ' en ' + this.practice.limit + ' coups maximum.' : '.') });
-  this.tick = setInterval(function () { self.clockTick(); }, 100);
+  if (tc.b) this.tick = setInterval(function () { self.clockTick(); }, 100);
   this.lastT = performance.now();
+  this.onVis = function () { self.lastT = performance.now(); };
+  document.addEventListener('visibilitychange', this.onVis);
   this.onKey = function (e) { if (e.key === 'ArrowLeft') self.nav(-1); else if (e.key === 'ArrowRight') self.nav(1); };
   document.addEventListener('keydown', this.onKey);
   App.onSettings = function (k) { if (k === 'coords') self.board.drawSquares(); if (k === 'comments') self.renderBubble(); self.render(false); };
   setTimeout(function () { self.maybeBot(); }, 350);
 }
 Game.prototype.destroy = function () {
-  this.token++; clearInterval(this.tick); document.removeEventListener('keydown', this.onKey);
+  this.dead = true;
+  this.token++; clearInterval(this.tick); document.removeEventListener('keydown', this.onKey); document.removeEventListener('visibilitychange', this.onVis);
   if (this.ro) this.ro.disconnect(); App.onSettings = null; App.currentGame = null;
   if (EngineClient.busy()) EngineClient.reset();
 };
@@ -3588,6 +2891,7 @@ Game.prototype.userMove = function (from, to, animated) {
 };
 Game.prototype.play = function (uci, o) {
   o = o || {};
+  if (this.dead) return false;
   var p = this.pos, m = p.parseMove(uci); if (!m) return false;
   var L = p.legal(), san = p.san(m, L), fenBefore = p.fen();
   var fl = Engine.mFlags(m), cap = !!(fl & Engine.F_CAP), castle = !!(fl & Engine.F_CASTLE), promo = Engine.mPromo(m);
@@ -3628,7 +2932,7 @@ Game.prototype.noteScriptExit = function () {
   toast(this.scriptOn() ? 'Fin de la partie jouée : on continue librement.' : 'Tu as quitté la partie jouée : je réponds librement.', 2800);
 };
 Game.prototype.maybeBot = function () {
-  if (this.result || this.mode === 'local' || this.isUserTurn() || this.thinkingTok) return;
+  if (this.dead || this.result || this.mode === 'local' || this.isUserTurn() || this.thinkingTok) return;
   this.noteScriptExit();
   var self = this, tok = ++this.token, t0 = performance.now(), scripted = this.scriptMove();
   this.thinking = true; this.thinkingTok = tok; this.renderBars();
@@ -3923,6 +3227,7 @@ Game.prototype.openSettings = function () {
 /* ---------- horloge ---------- */
 Game.prototype.clockTick = function () {
   var now = performance.now(), dt = now - this.lastT; this.lastT = now;
+  if (document.hidden) return;
   if (!this.tc.b || this.result || this.hist.length < 2) return;
   var c = this.turnColor();
   this.clock[c] -= dt;
@@ -3995,7 +3300,7 @@ Game.prototype.fillBar = function (el, c) {
   if (this.mode === 'bot' && c !== this.userColor) elo = '(' + this.bot.elo + ')';
   else if (this.mode === 'coach' && c !== this.userColor) elo = '(≈' + this.coachElo() + ')';
   else if ((this.mode === 'bot' || this.mode === 'coach') && c === this.userColor) elo = '(' + App.profile.rating + ')';
-  var info = h('div', { class: 'pinfo' }, h('div', { class: 'pname', html: name + (elo ? '<small>' + elo + '</small>' : '') + (this.thinking && c !== this.userColor && this.mode !== 'local' ? '<span class="thinking"><i></i><i></i><i></i></span>' : '') }));
+  var info = h('div', { class: 'pinfo' }, h('div', { class: 'pname', html: esc(name) + (elo ? '<small>' + elo + '</small>' : '') + (this.thinking && c !== this.userColor && this.mode !== 'local' ? '<span class="thinking"><i></i><i></i><i></i></span>' : '') }));
   // pièces capturées par c (= pièces manquantes de l'adversaire)
   var caps = h('div', { class: 'caps' }), oc = c === 'w' ? 'b' : 'w', any = false;
   ['P', 'N', 'B', 'R', 'Q'].forEach(function (t, k) {
@@ -4104,7 +3409,13 @@ function phaseOf(fen, ply) {
   if (np <= 26 || (!m[0][5] && !m[1][5] && np <= 32)) return 'end';
   return ply < 20 ? 'open' : 'mid';
 }
+var ReviewCache = typeof WeakMap !== 'undefined' ? new WeakMap() : null;
 function buildReview(g, evals) {
+  var c = ReviewCache && ReviewCache.get(g); if (c && c.evals === evals) return c.R;
+  var R = buildReview0(g, evals); if (ReviewCache) ReviewCache.set(g, { evals: evals, R: R });
+  return R;
+}
+function buildReview0(g, evals) {
   var p = new Engine.Pos().load(g.startFen || Engine.START), moves = [], acc = { w: [], b: [] }, counts = { w: {}, b: {} };
   var fenStart = p.fen();
   for (var i = 0; i < g.moves.length; i++) {
@@ -4939,7 +4250,7 @@ Screens.mistakes = function () {
       var C = CLASSES[x.cls], p = x.fen.split(' ');
       list.appendChild(h('button', { class: 'li', onclick: function () { App.go('mistake', { queue: [x.id] }); } },
         miniBoard(x.fen, p[1]),
-        h('div', { class: 'li-main' }, h('b', { html: '<span class="pill" style="background:' + C.color + ';color:#fff">' + C.sym + '</span>' + 'Contre ' + x.opp + ' · coup ' + p[5] }),
+        h('div', { class: 'li-main' }, h('b', { html: '<span class="pill" style="background:' + C.color + ';color:#fff">' + C.sym + '</span>' + 'Contre ' + esc(x.opp) + ' · coup ' + p[5] }),
           h('small', { text: 'Tu avais joué ' + fmtSan(x.playedSan) + ' · ' + new Date(x.date).toLocaleDateString('fr-FR') + (x.tries ? ' · ' + x.wins + '/' + x.tries + ' réussis' : '') })),
         h('span', { class: 'tag', text: dueLabel(x) })));
     });
@@ -5166,7 +4477,7 @@ Screens['import'] = function () {
       pane.appendChild(common(function () {
         var r = parsePGN(ta.value || '');
         err.innerHTML = '';
-        if (r.error) { err.appendChild(h('div', { class: 'feedback bad', html: icon('close') + '<span>' + r.error + (r.uci && r.uci.length ? ' Les ' + r.uci.length + ' demi-coups précédents sont corrects.' : '') + '</span>' })); return; }
+        if (r.error) { err.appendChild(h('div', { class: 'feedback bad', html: icon('close') + '<span>' + esc(r.error) + (r.uci && r.uci.length ? ' Les ' + r.uci.length + ' demi-coups précédents sont corrects.' : '') + '</span>' })); return; }
         launch(r.uci, r.start, r.result, r.headers);
       }));
     } else {
@@ -5206,7 +4517,7 @@ Screens['import'] = function () {
 };
 
 (function(){
-    function start(){ EngineClient.init(); ReviewEngine.init(); Book.init(); App.applyLook();
+    function start(){ EngineClient.init(); Book.init(); App.applyLook();
       var saved=Store.get('current',null);
       App.go('home',{},{root:true});
     }
